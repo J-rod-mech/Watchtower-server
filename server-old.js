@@ -1,20 +1,8 @@
 const http = require('http');
-const fs = require('fs');
-const path = require('path');
 const Database = require('better-sqlite3');
 
 const PORT = process.env.PORT || 3000;
 const MAX_EVENTS = 10000;
-const ACTIVE_USER_WINDOW = 5 * 60 * 1000;
-const sseClients = new Set();
-const MIME = {
-  '.html': 'text/html',
-  '.css': 'text/css',
-  '.js': 'application/javascript',
-  '.json': 'application/json',
-  '.png': 'image/png',
-  '.svg': 'image/svg+xml'
-};
 
 const db = new Database('app.db');
 
@@ -65,23 +53,14 @@ const countEventsStmt = db.prepare('SELECT COUNT(*) AS count FROM events');
  * @returns {void}
  */
 function sendJson(res, status, data) {
-  applyCors(res);
   res.writeHead(status, {
-    'Content-Type': 'application/json'
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type'
   });
 
   res.end(JSON.stringify(data));
-}
-
-/**
- * Applies permissive CORS headers to a response.
- * @param {import('http').ServerResponse} res - HTTP response object.
- * @returns {void}
- */
-function applyCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 }
 
 /**
@@ -104,8 +83,6 @@ function parseBody(req) {
         reject(err);
       }
     });
-
-    req.on('error', reject);
   });
 }
 
@@ -283,88 +260,6 @@ function parseLimit(value, fallback) {
 }
 
 /**
- * Sends event batches to all active SSE clients.
- * @param {Array<Record<string, unknown>>} eventBatch - Newly accepted events.
- * @returns {void}
- */
-function broadcastEvents(eventBatch) {
-  const eventPayload = JSON.stringify(eventBatch);
-  for (const client of sseClients) {
-    client.write(`data: ${eventPayload}\n\n`);
-  }
-}
-
-/**
- * Resolves app routes into static asset paths.
- * @param {string} pathname - Incoming URL pathname.
- * @returns {string}
- */
-function resolveStaticPath(pathname) {
-  if (pathname === '/' || pathname === '') {
-    return '/index.html';
-  }
-  if (pathname === '/demo' || pathname === '/demo/') {
-    return '/demo/index.html';
-  }
-  if (pathname === '/sdk/watchtower.js') {
-    return '/sdk/watchtower.js';
-  }
-  return pathname;
-}
-
-/**
- * Serves a static file from the repository parent directory.
- * @param {import('http').ServerResponse} res - HTTP response object.
- * @param {string} pathname - Incoming URL pathname.
- * @returns {void}
- */
-function serveStaticFile(res, pathname) {
-  const candidateRoot = path.join(__dirname, '..');
-  const requestedPath = resolveStaticPath(pathname);
-  const filePath = path.join(candidateRoot, requestedPath);
-  const resolvedFilePath = path.resolve(filePath);
-  const resolvedRoot = path.resolve(candidateRoot);
-
-  if (!resolvedFilePath.startsWith(resolvedRoot)) {
-    res.writeHead(403);
-    res.end('Forbidden');
-    return;
-  }
-
-  fs.stat(resolvedFilePath, (error, fileStat) => {
-    if (error || !fileStat.isFile()) {
-      res.writeHead(404);
-      res.end('Not found');
-      return;
-    }
-
-    const extension = path.extname(resolvedFilePath);
-    res.writeHead(200, {
-      'Content-Type': MIME[extension] || 'application/octet-stream'
-    });
-    fs.createReadStream(resolvedFilePath).pipe(res);
-  });
-}
-
-/**
- * Builds fixed 7-slot series data aligned right with zero padding.
- * @param {Array<Record<string, unknown>>} events - Source events ordered oldest-to-newest.
- * @param {(event: Record<string, unknown>, index: number, window: Array<Record<string, unknown>>) => number} valueGetter - Series value callback.
- * @returns {{labels: string[], values: number[]}}
- */
-function buildSeries(events, valueGetter) {
-  const labels = ['1', '2', '3', '4', '5', '6', '7'];
-  const values = [0, 0, 0, 0, 0, 0, 0];
-  const window = events.slice(-7);
-
-  for (let i = 0; i < window.length; i += 1) {
-    values[labels.length - window.length + i] = valueGetter(window[i], i, window);
-  }
-
-  return { labels, values };
-}
-
-/**
  * Main HTTP request handler for the WatchTower event API.
  * @param {import('http').IncomingMessage} req - HTTP request object.
  * @param {import('http').ServerResponse} res - HTTP response object.
@@ -372,8 +267,11 @@ function buildSeries(events, valueGetter) {
  */
 const server = http.createServer(async (req, res) => {
   if (req.method === 'OPTIONS') {
-    applyCors(res);
-    res.writeHead(204);
+    res.writeHead(204, {
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type'
+    });
     return res.end();
   }
 
@@ -416,18 +314,6 @@ const server = http.createServer(async (req, res) => {
       }
 
       pruneIfNeeded();
-      broadcastEvents(events.map((event) => ({
-        type: event.type,
-        timestamp: event.timestamp,
-        sessionId: event.sessionId ?? null,
-        userId: event.userId ?? null,
-        deployVersion: event.deployVersion ?? null,
-        appName: event.appName ?? null,
-        url: event.url ?? null,
-        route: event.route ?? null,
-        data: event.data,
-        receivedAt
-      })));
       return sendJson(res, 200, { accepted: events.length });
     } catch (err) {
       return sendJson(res, 400, { error: 'Invalid JSON' });
@@ -471,7 +357,7 @@ const server = http.createServer(async (req, res) => {
       FROM events
       WHERE session_id IS NOT NULL
       AND received_at >= ?
-    `).get(new Date(Date.now() - ACTIVE_USER_WINDOW).toISOString());
+    `).get(new Date(Date.now() - 5 * 60 * 1000).toISOString());
 
     const errorsByVersionRows = db.prepare(`
       SELECT COALESCE(deploy_version, 'unknown') AS deploy_version, COUNT(*) AS count
@@ -484,28 +370,7 @@ const server = http.createServer(async (req, res) => {
       SELECT * FROM events
       WHERE type = 'error'
       ORDER BY id DESC
-      LIMIT 20
-    `).all();
-
-    const recentActivityRows = db.prepare(`
-      SELECT * FROM events
-      ORDER BY id DESC
-      LIMIT 20
-    `).all();
-
-    const lastSevenRowsAsc = db.prepare(`
-      SELECT * FROM (
-        SELECT * FROM events
-        ORDER BY id DESC
-        LIMIT 7
-      )
-      ORDER BY id ASC
-    `).all();
-
-    const analyticsSourceRows = db.prepare(`
-      SELECT type, session_id, data_json
-      FROM events
-      ORDER BY id ASC
+      LIMIT 50
     `).all();
 
     const pageloadRows = db.prepare(`
@@ -570,115 +435,26 @@ const server = http.createServer(async (req, res) => {
       errorsByVersion[row.deploy_version] = row.count;
     }
 
-    const breakdownCounts = {
-      performance: 0,
-      errors: 0,
-      feedback: 0,
-      clicks: 0
-    };
-    const feedbackBreakdown = { 5: 0, 4: 0, 3: 0, 2: 0, 1: 0 };
-    const feedbackRatings = [];
-    let customActivityTotal = 0;
-
-    for (const row of analyticsSourceRows) {
-      if (row.type === 'pageload') {
-        breakdownCounts.performance += 1;
-      }
-      if (row.type === 'error') {
-        breakdownCounts.errors += 1;
-      }
-      if (row.type === 'click') {
-        breakdownCounts.clicks += 1;
-      }
-      if (row.type === 'custom' || row.type === 'login' || row.type === 'feedback') {
-        customActivityTotal += 1;
-      }
-      if (row.type === 'feedback') {
-        breakdownCounts.feedback += 1;
-        try {
-          const data = JSON.parse(row.data_json);
-          const rating = Number(data.rating);
-          if (Number.isFinite(rating)) {
-            feedbackRatings.push(rating);
-            if (feedbackBreakdown[rating] === undefined) {
-              feedbackBreakdown[rating] = 0;
-            }
-            feedbackBreakdown[rating] += 1;
-          }
-        } catch (_ignored) {
-          // Ignore malformed payloads in analytics-only projections.
-        }
-      }
-    }
-
-    const userSeries = buildSeries(lastSevenRowsAsc.map((row) => ({
-      sessionId: row.session_id
-    })), (_event, index, relevantEvents) => {
-      const uniqueSessionIds = new Set();
-      for (let i = 0; i <= index; i += 1) {
-        uniqueSessionIds.add(relevantEvents[i].sessionId);
-      }
-      return uniqueSessionIds.size;
-    });
-
-    const activitySeries = buildSeries(lastSevenRowsAsc.map((row) => ({
-      type: row.type
-    })), (event) => {
-      if (event.type === 'custom' || event.type === 'feedback' || event.type === 'login') {
-        return 1;
-      }
-      return 0;
-    });
-
     return sendJson(res, 200, {
       activeUsers: activeUsersRows.count,
       totalEvents,
       totalErrors: recentErrorRows.length,
       errorsByVersion,
       latencyByRoute: outputLatencyByRoute,
-      recentErrors: recentErrorRows.map(rowToEvent),
-      recentActivity: recentActivityRows.map(rowToEvent),
-      analytics: {
-        userSeries,
-        activitySeries,
-        breakdownCounts,
-        feedbackAverage: feedbackRatings.length > 0 ? calculateAverage(feedbackRatings) : 0,
-        feedbackTotal: feedbackRatings.length,
-        feedbackBreakdown,
-        customActivityTotal
-      }
+      recentErrors: recentErrorRows.map(rowToEvent)
     });
   }
 
   if (req.method === 'GET' && path === '/api/events/stream') {
-    applyCors(res);
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream',
-      'Cache-Control': 'no-cache',
-      Connection: 'keep-alive'
+    res.writeHead(501, {
+      'Content-Type': 'application/json',
+      'Access-Control-Allow-Origin': '*'
     });
-    res.write(':\n\n');
-    sseClients.add(res);
-    req.on('close', () => {
-      sseClients.delete(res);
-    });
-    return;
+    return res.end(JSON.stringify({ error: 'SSE stream not implemented in this server build' }));
   }
 
-  return serveStaticFile(res, path);
+  return sendJson(res, 404, { error: 'Route not found' });
 });
-
-/**
- * Computes the arithmetic mean for a numeric array.
- * @param {number[]} values - Input values.
- * @returns {number}
- */
-function calculateAverage(values) {
-  if (values.length === 0) {
-    return 0;
-  }
-  return values.reduce((sum, value) => sum + value, 0) / values.length;
-}
 
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
